@@ -82,10 +82,13 @@ const GEMINI_OAUTH_PATH = join(homedir(), ".gemini", "oauth_creds.json");
 const GEMINI_QUOTA_CACHE_PATH = join(homedir(), ".omc", "state", "gemini_quota_cache.json");
 const GEMINI_PROJECT_CACHE_PATH = join(homedir(), ".omc", "state", "gemini_project_id.json");
 const GEMINI_SESSION_CACHE_PATH = join(homedir(), ".omc", "state", "gemini_session_tokens_cache.json");
+const GEMINI_RPM_TRACKER_PATH = join(homedir(), ".omc", "state", "gemini_rpm_tracker.json");
+const GEMINI_RPM_LIMIT = 60; // oauth-personal RPM 한도
+const GEMINI_RPM_WINDOW_MS = 60 * 1000; // 60초 슬라이딩 윈도우
 const GEMINI_QUOTA_STALE_MS = 5 * 60 * 1000; // 5분
 const GEMINI_SESSION_STALE_MS = 15 * 1000; // 15초
 const GEMINI_API_TIMEOUT_MS = 3000; // 3초
-const ACCOUNT_LABEL_WIDTH = 14;
+const ACCOUNT_LABEL_WIDTH = 10;
 const PROVIDER_PREFIX_WIDTH = 2;
 const PERCENT_CELL_WIDTH = 4;
 const TIME_CELL_INNER_WIDTH = 6;
@@ -155,14 +158,17 @@ function getProviderAccountId(provider, accountsConfig, accountsState) {
 
 function renderAlignedRows(rows) {
   const rightRows = rows.filter((row) => stripAnsi(String(row.right || "")).trim().length > 0);
-  const leftWidth = rightRows.reduce((max, row) => Math.max(max, stripAnsi(row.left).length), 0);
+  const rawLeftWidth = rightRows.reduce((max, row) => Math.max(max, stripAnsi(row.left).length), 0);
   return rows.map((row) => {
     const prefix = padAnsiRight(row.prefix, PROVIDER_PREFIX_WIDTH);
     const hasRight = stripAnsi(String(row.right || "")).trim().length > 0;
     if (!hasRight) {
       return `${prefix} ${row.left}`;
     }
-    const left = padAnsiRight(row.left, leftWidth);
+    // 자기 left 대비 패딩 상한: 최대 2칸까지만 패딩 (과도한 공백 방지)
+    const ownLen = stripAnsi(row.left).length;
+    const effectiveWidth = Math.min(rawLeftWidth, ownLen + 2);
+    const left = padAnsiRight(row.left, effectiveWidth);
     return `${prefix} ${left} ${dim("|")} ${row.right}`;
   });
 }
@@ -452,6 +458,33 @@ async function fetchGeminiQuota(accountId, options = {}) {
   return result;
 }
 
+/**
+ * Gemini RPM 트래커에서 최근 60초 내 요청 수를 읽는다.
+ * @returns {{ count: number, percent: number, remainingSec: number }}
+ */
+function readGeminiRpm() {
+  try {
+    if (!existsSync(GEMINI_RPM_TRACKER_PATH)) return { count: 0, percent: 0, remainingSec: 60 };
+    const raw = readFileSync(GEMINI_RPM_TRACKER_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    const timestamps = Array.isArray(parsed.timestamps) ? parsed.timestamps : [];
+    const now = Date.now();
+    const recent = timestamps.filter((t) => now - t < GEMINI_RPM_WINDOW_MS);
+    const count = recent.length;
+    const percent = clampPercent(Math.round((count / GEMINI_RPM_LIMIT) * 100));
+    // 가장 오래된 엔트리가 윈도우에서 빠지기까지 남은 초
+    // 가장 오래된 엔트리가 윈도우에서 빠지기까지 남은 초 (0건이면 0s)
+    // 5초 단위 반올림으로 HUD 깜빡임 감소
+    const rawRemainingSec = recent.length > 0
+      ? Math.max(0, Math.ceil((GEMINI_RPM_WINDOW_MS - (now - Math.min(...recent))) / 1000))
+      : 0;
+    const remainingSec = Math.ceil(rawRemainingSec / 5) * 5;
+    return { count, percent, remainingSec };
+  } catch {
+    return { count: 0, percent: 0, remainingSec: 60 };
+  }
+}
+
 function readGeminiQuotaSnapshot(accountId, authContext) {
   const cache = readJson(GEMINI_QUOTA_CACHE_PATH, null);
   if (!cache?.buckets) {
@@ -620,7 +653,7 @@ function getClaudeRows(stdin, snapshot) {
         right: "",
       },
       {
-        prefix: `${dim("c")}:`,
+        prefix: `${bold(claudeOrange("c"))}:`,
         left: quotaSection,
         right: "",
       },
@@ -679,24 +712,29 @@ function getProviderRow(provider, marker, markerColor, qosProfile, accountsConfi
 
   if (realQuota?.type === "gemini") {
     const bucket = realQuota.quotaBucket;
-    const session = realQuota.session;
-    if (session?.total) {
-      extraRightSection = `${dim("|")} ${dim("tok:")}${dim(formatTokenCount(session.total))}`;
-    }
+    const rpm = readGeminiRpm();
+    // rate 섹션을 left(1m 바 뒤)에 배치해서 | 정렬 갭 채우기
     const rateLimitSection = recent429 > 0
-      ? `${dim("rate:")}${red(`${recent429}(429)`)}` 
+      ? `${dim("rate:")}${red(`${recent429}(429)`)}`
       : `${dim("rate:")}${dim("0")}`;
+    // 1m: RPM 바 (로컬 카운팅 기반, 카운트 표시로 깜빡임 방지)
+    // "5/60" → " 5/60" (5자 고정폭, 최대 "60/60")
+    const rpmCountRaw = `${rpm.count}/${GEMINI_RPM_LIMIT}`;
+    const rpmCountStr = rpmCountRaw.padStart(5);
+    const rpmBar = `${dim("1m:")}${coloredBar(rpm.percent, 6)} ` +
+      `${colorByPercent(rpm.percent, rpmCountStr)} ${rateLimitSection}`;
     if (bucket) {
       // API에서 가져온 실측 쿼터
       const usedP = clampPercent((1 - (bucket.remainingFraction ?? 1)) * 100);
       const rstRemaining = formatResetRemaining(bucket.resetTime) || "n/a";
       quotaSection = `${dim("1d:")}${coloredBar(usedP, 6)} ` +
         `${colorByPercent(usedP, formatPercentCell(usedP))} ${dim(formatTimeCell(rstRemaining))} ` +
-        `${rateLimitSection}`;
+        rpmBar;
     } else {
       // 비동기 갱신 전 플레이스홀더 (회색)
       quotaSection = `${dim("1d:")}${dim("░░░░░░")} ${dim(formatPlaceholderPercentCell())} ` +
-        `${dim(formatTimeCell("--h--m"))} ${rateLimitSection}`;
+        `${dim(formatTimeCell("--h--m"))} ` +
+        rpmBar;
     }
   }
 
@@ -711,7 +749,7 @@ function getProviderRow(provider, marker, markerColor, qosProfile, accountsConfi
   }
 
   const prefix = `${bold(markerColor(`${marker}`))}:`;
-  const accountSection = `${dim("acct:")}${markerColor(accountLabel)}`;
+  const accountSection = `${markerColor(accountLabel)}`;
   return {
     prefix,
     left: quotaSection,
