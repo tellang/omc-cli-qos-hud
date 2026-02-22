@@ -858,6 +858,43 @@ async function main() {
     || geminiQuota?.buckets?.find((b) => b.modelId === "gemini-3-flash-preview")
     || null;
 
+  if (COMPACT_MODE) {
+    // ── 컴팩트: 한 줄로 전체 프로바이더 요약 ──
+    const contextPercent = getContextPercent(stdin);
+    const totalTokens = Number(claudeSnapshot.totalInputTokens || 0)
+      + Number(claudeSnapshot.totalCacheCreation || 0)
+      + Math.round(Number(claudeSnapshot.totalCacheRead || 0) * 0.1);
+    const startTime = claudeSnapshot.startTime ? new Date(claudeSnapshot.startTime).getTime() : Date.now();
+    const elapsedMs = Math.max(0, Date.now() - startTime);
+    const fiveHour = estimateWindowUsage(totalTokens, CLAUDE_FIVE_HOUR_TOKEN_CAP, elapsedMs, FIVE_HOUR_MS);
+
+    // Codex
+    let xPart = "";
+    if (codexBuckets) {
+      const main = codexBuckets.codex || codexBuckets[Object.keys(codexBuckets)[0]];
+      if (main) {
+        const fiveP = clampPercent(main.primary?.used_percent ?? 0);
+        xPart = `${bold(codexWhite("x"))}${colorByPercent(fiveP, `${fiveP}%`)}`;
+      }
+    }
+    if (!xPart) xPart = `${bold(codexWhite("x"))}${green("0%")}`;
+
+    // Gemini
+    let gPart = "";
+    if (geminiBucket) {
+      const usedP = clampPercent((1 - (geminiBucket.remainingFraction ?? 1)) * 100);
+      gPart = `${bold(geminiBlue("g"))}${colorByPercent(usedP, `${usedP}%`)}`;
+    } else {
+      gPart = `${bold(geminiBlue("g"))}${dim("--%")}`;
+    }
+
+    const line = `${bold(claudeOrange("c"))}${colorByPercent(fiveHour.percent, `${fiveHour.percent}%`)} ` +
+      `${xPart} ${gPart} ` +
+      `${dim("ctx:")}${colorByPercent(contextPercent, `${contextPercent}%`)}`;
+    process.stdout.write(`${line}\n`);
+    return;
+  }
+
   const rows = [
     ...getClaudeRows(stdin, claudeSnapshot),
     getProviderRow("codex", "x", codexWhite, qosProfile, accountsConfig, accountsState,
