@@ -128,19 +128,50 @@ function syncProvider(providerState, accountState) {
   providerState.updated_at = nowIso();
 }
 
-function classifyFailure(errorText) {
+export function classifyFailure(errorText) {
   const text = String(errorText || "");
-  if (/rate.?limit|429|too many requests|quota/i.test(text)) return "rate_limit";
-  if (/timeout|timed out|etimedout|econnreset|gateway timeout/i.test(text)) return "timeout";
-  if (/auth|unauthori|forbidden|401|403|login|credential/i.test(text)) return "auth";
+  // 429와 job id=1429 구분 등을 위해 \b 또는 명확한 매칭 필요
+  if (/(?:rate.?limit|\b429\b|too many requests|request throttled|quota)/i.test(text)) return "rate_limit";
+  if (/(?:timeout|timed out|etimedout|econnreset|deadline exceeded|gateway timeout)/i.test(text)) return "timeout";
+  if (/(?:\b401\b|auth|unauthori|forbidden|403|login|credential|token expired|permission denied)/i.test(text)) return "auth";
   return "default";
 }
 
 export function inferProvider(command) {
   const cmd = String(command || "");
-  if (/\bcodex\s+exec\b/i.test(cmd)) return "codex";
-  if (/\bgemini\s+-y\s+-p\b/i.test(cmd)) return "gemini";
+  // codex.exe, gemini.exe 및 다양한 플래그 순서 대응
+  if (/\bcodex(?:\.exe)?\s+(?:--\w+\s+\w+\s+)*exec\b/i.test(cmd)) return "codex";
+  if (/\bgemini(?:\.exe)?\s+(?:.*?-y|.*?--yes)\s+-p\b/i.test(cmd)) return "gemini";
+  if (/\bgemini(?:\.exe)?\s+-p\s+.*?(?:-y|--yes)\b/i.test(cmd)) return "gemini";
   return null;
+}
+
+export function hasStdoutRedirect(command) {
+  const cmd = String(command || "");
+  // 프롬프트 내부의 리다이렉션 문자열과 실제 쉘 리다이렉션 구분은 어렵지만, 기본적인 감지 시도
+  return /(?:\s|^)(?:1?>|>>)\s*[^&]/.test(cmd);
+}
+
+export function hasStderrRedirect(command) {
+  const cmd = String(command || "");
+  // 2> 감지, 2>&1은 stderr가 stdout으로 병합되는 것이므로 별도 stderr 리다이렉션 파일로 보지 않음
+  return /(?:\s|^)2>\s*[^&]/.test(cmd);
+}
+
+export function isAllowedPath(filePath) {
+  const path = String(filePath || "").replace(/\\/g, "/");
+  const basename = path.split("/").pop();
+  
+  // 필수 허용 패턴들
+  if (path.includes(".omc/state/")) return true;
+  if (path.includes(".claude/settings.json")) return true;
+  if (path.includes(".claude/hooks/")) return true;
+  if (["CLAUDE.md", "AGENTS.md", "README.md"].includes(basename)) {
+    // docs/NOT_CLAUDE.md 처럼 basename만 일치하는 경우 방지 (완전 일치 또는 최상위 가정)
+    return !path.includes("/") || path.split("/").length === 1;
+  }
+  
+  return false;
 }
 
 export function extractAccountId(command) {

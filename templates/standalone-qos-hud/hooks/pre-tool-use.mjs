@@ -11,40 +11,58 @@ const { inferProvider, extractAccountId, buildHint, getStatePath } = await impor
   pathToFileURL(join(__dirname, "lib", "qos-state.mjs")).href
 );
 
-const input = await new Promise((resolve) => {
-  const chunks = [];
-  process.stdin.on("data", (c) => chunks.push(c));
-  process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-  process.stdin.on("error", () => resolve(""));
-});
+async function main() {
+  try {
+    const input = await new Promise((resolve) => {
+      const chunks = [];
+      process.stdin.on("data", (c) => chunks.push(c));
+      process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+      process.stdin.on("error", () => resolve(""));
+    });
 
-let data = {};
-try { data = JSON.parse(input || "{}"); } catch {}
+    let data = {};
+    try { 
+      data = JSON.parse(input || "{}"); 
+    } catch (e) {
+      throw new Error(`Invalid JSON input: ${e.message}`);
+    }
 
-const toolName = data.tool_name || data.toolName || "";
-if (!/^(Bash|bash)$/.test(String(toolName))) {
-  console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-  process.exit(0);
+    const toolName = data.tool_name || data.toolName || "";
+    if (!/^(Bash|bash)$/.test(String(toolName))) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    const command = String((data.tool_input || data.toolInput || {}).command || "");
+    const provider = inferProvider(command);
+    if (!provider) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    const accountId = extractAccountId(command);
+    const hint = buildHint(provider, accountId);
+    if (!hint) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    console.log(JSON.stringify({
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        additionalContext: `${hint}\n[STATE] ${getStatePath()}`,
+      },
+    }));
+  } catch (err) {
+    const failOpen = process.env.OMC_HOOK_FAIL_OPEN === "1";
+    if (failOpen) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    } else {
+      console.error(`[OMC-QOS-ERROR] ${err.message}`);
+      process.exit(1);
+    }
+  }
 }
 
-const command = String((data.tool_input || data.toolInput || {}).command || "");
-const provider = inferProvider(command);
-if (!provider) {
-  console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-  process.exit(0);
-}
-
-const accountId = extractAccountId(command);
-const hint = buildHint(provider, accountId);
-if (!hint) {
-  console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-  process.exit(0);
-}
-
-console.log(JSON.stringify({
-  continue: true,
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    additionalContext: `${hint}\n[STATE] ${getStatePath()}`,
-  },
-}));
+main();
