@@ -98,6 +98,11 @@ const GEMINI_SESSION_REFRESH_FLAG = "--refresh-gemini-session";
 const CONTEXT_ALERT_SPLIT_THRESHOLD = 95;
 
 // ============================================================================
+// 모바일/Termux 컴팩트 모드 감지
+// ============================================================================
+const COMPACT_MODE = !!(process.env.TERMUX_VERSION || process.argv.includes("--compact"));
+
+// ============================================================================
 // 유틸
 // ============================================================================
 async function readStdinJson() {
@@ -632,6 +637,16 @@ function getClaudeRows(stdin, snapshot) {
   const fiveHour = estimateWindowUsage(totalTokens, CLAUDE_FIVE_HOUR_TOKEN_CAP, elapsedMs, FIVE_HOUR_MS);
   const weekly = estimateWindowUsage(totalTokens, CLAUDE_WEEK_TOKEN_CAP, elapsedMs, SEVEN_DAY_MS);
   const contextPercent = getContextPercent(stdin);
+  const prefix = `${bold(claudeOrange("c"))}:`;
+
+  if (COMPACT_MODE) {
+    // 컴팩트: 바 없이 퍼센트+시간만
+    const quotaSection = `${dim("5h:")}${colorByPercent(fiveHour.percent, `${fiveHour.percent}%`)} ` +
+      `${dim("wk:")}${colorByPercent(weekly.percent, `${weekly.percent}%`)} ` +
+      `${dim("ctx:")}${colorByPercent(contextPercent, `${contextPercent}%`)}`;
+    return [{ prefix, left: quotaSection, right: "" }];
+  }
+
   const fiveHourBar = coloredBar(fiveHour.percent, 6);
   const weeklyBar = coloredBar(weekly.percent, 6);
   const ctxBar = coloredBar(contextPercent, 6);
@@ -639,7 +654,6 @@ function getClaudeRows(stdin, snapshot) {
   const weeklyPercentCell = formatPercentCell(weekly.percent);
   const fiveHourTimeCell = formatTimeCell(fiveHour.remaining);
   const weeklyTimeCell = formatTimeCell(weekly.remaining);
-  const prefix = `${bold(claudeOrange("c"))}:`;
   const quotaSection = `${dim("5h:")}${fiveHourBar} ${colorByPercent(fiveHour.percent, fiveHourPercentCell)} ` +
     `${dim(fiveHourTimeCell)} ` +
     `${dim("wk:")}${weeklyBar} ${colorByPercent(weekly.percent, weeklyPercentCell)} ` +
@@ -695,6 +709,36 @@ function getProviderRow(provider, marker, markerColor, qosProfile, accountsConfi
   // ── 쿼터 섹션 ──
   let quotaSection;
   let extraRightSection = "";
+
+  if (COMPACT_MODE) {
+    // 컴팩트 모드: 바 없이 퍼센트만, right 섹션 생략
+    if (realQuota?.type === "codex") {
+      const main = realQuota.buckets.codex || realQuota.buckets[Object.keys(realQuota.buckets)[0]];
+      if (main) {
+        const fiveP = clampPercent(main.primary?.used_percent ?? 0);
+        const weekP = clampPercent(main.secondary?.used_percent ?? 0);
+        quotaSection = `${dim("5h:")}${colorByPercent(fiveP, `${fiveP}%`)} ` +
+          `${dim("wk:")}${colorByPercent(weekP, `${weekP}%`)}`;
+      }
+    }
+    if (realQuota?.type === "gemini") {
+      const bucket = realQuota.quotaBucket;
+      const rpm = readGeminiRpm();
+      if (bucket) {
+        const usedP = clampPercent((1 - (bucket.remainingFraction ?? 1)) * 100);
+        quotaSection = `${dim("1d:")}${colorByPercent(usedP, `${usedP}%`)} ` +
+          `${dim("rpm:")}${colorByPercent(rpm.percent, `${rpm.count}/${GEMINI_RPM_LIMIT}`)}`;
+      } else {
+        quotaSection = `${dim("1d:")}${dim("--%")} ` +
+          `${dim("rpm:")}${colorByPercent(rpm.percent, `${rpm.count}/${GEMINI_RPM_LIMIT}`)}`;
+      }
+    }
+    if (!quotaSection) {
+      quotaSection = `${dim("5h:")}${green("0%")} ${dim("wk:")}${green("0%")}`;
+    }
+    const prefix = `${bold(markerColor(`${marker}`))}:`;
+    return { prefix, left: quotaSection, right: "" };
+  }
 
   if (realQuota?.type === "codex") {
     const main = realQuota.buckets.codex || realQuota.buckets[Object.keys(realQuota.buckets)[0]];
