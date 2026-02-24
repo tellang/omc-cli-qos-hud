@@ -64,15 +64,16 @@ function coloredBar(percent, width = 8) {
 // ============================================================================
 // 상수 / 경로
 // ============================================================================
-const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
-const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000;
-const CLAUDE_FIVE_HOUR_TOKEN_CAP = 2_000_000;
-const CLAUDE_WEEK_TOKEN_CAP = 20_000_000;
-
 const QOS_PATH = join(homedir(), ".omc", "state", "cli_qos_profile.json");
 const ACCOUNTS_CONFIG_PATH = join(homedir(), ".omc", "router", "accounts.json");
 const ACCOUNTS_STATE_PATH = join(homedir(), ".omc", "state", "cli_accounts_state.json");
-const CLAUDE_SNAPSHOT_PATH = join(homedir(), ".omc", "state", "session-token-stats.json");
+
+// Claude OAuth Usage API (api.anthropic.com/api/oauth/usage)
+const CLAUDE_CREDENTIALS_PATH = join(homedir(), ".claude", ".credentials.json");
+const CLAUDE_USAGE_CACHE_PATH = join(homedir(), ".omc", "state", "claude_usage_cache.json");
+const CLAUDE_USAGE_STALE_MS = 30 * 1000; // 30초 캐시
+const CLAUDE_API_TIMEOUT_MS = 10_000;
+const DEFAULT_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CODEX_AUTH_PATH = join(homedir(), ".codex", "auth.json");
 const CODEX_QUOTA_CACHE_PATH = join(homedir(), ".omc", "state", "codex_rate_limits_cache.json");
 const CODEX_QUOTA_STALE_MS = 15 * 1000; // 15초
@@ -92,6 +93,7 @@ const ACCOUNT_LABEL_WIDTH = 10;
 const PROVIDER_PREFIX_WIDTH = 2;
 const PERCENT_CELL_WIDTH = 4;
 const TIME_CELL_INNER_WIDTH = 6;
+const CLAUDE_REFRESH_FLAG = "--refresh-claude-usage";
 const CODEX_REFRESH_FLAG = "--refresh-codex-rate-limits";
 const GEMINI_REFRESH_FLAG = "--refresh-gemini-quota";
 const GEMINI_SESSION_REFRESH_FLAG = "--refresh-gemini-session";
@@ -107,11 +109,25 @@ const COMPACT_MODE = !!(process.env.TERMUX_VERSION || process.argv.includes("--c
 // ============================================================================
 async function readStdinJson() {
   if (process.stdin.isTTY) return {};
-  const chunks = [];
-  for await (const chunk of process.stdin) chunks.push(chunk);
-  const raw = chunks.join("").trim();
-  if (!raw) return {};
-  try { return JSON.parse(raw); } catch { return {}; }
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      process.stdin.destroy();
+      resolve({});
+    }, 200);
+    const chunks = [];
+    process.stdin.on("data", (chunk) => chunks.push(chunk));
+    process.stdin.on("end", () => {
+      clearTimeout(timeout);
+      const raw = chunks.join("").trim();
+      if (!raw) { resolve({}); return; }
+      try { resolve(JSON.parse(raw)); } catch { resolve({}); }
+    });
+    process.stdin.on("error", () => {
+      clearTimeout(timeout);
+      resolve({});
+    });
+    process.stdin.resume();
+  });
 }
 
 function readJson(filePath, fallback) {
@@ -234,8 +250,8 @@ function formatDuration(ms) {
   const days = Math.floor(totalMinutes / (60 * 24));
   const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
   const minutes = totalMinutes % 60;
-  if (days > 0) return `${days}d${hours}h`;
-  if (hours > 0) return `${hours}h${minutes}m`;
+  if (days > 0) return hours > 0 ? `${days}d${hours}h` : `${days}d`;
+  if (hours > 0) return minutes > 0 ? `${hours}h${minutes}m` : `${hours}h`;
   return `${minutes}m`;
 }
 
@@ -245,14 +261,168 @@ function formatTokenCount(n) {
   return String(n);
 }
 
-function estimateWindowUsage(totalTokens, capTokens, elapsedMs, windowMs) {
-  const usedPercent = clampPercent((totalTokens / capTokens) * 100);
-  if (usedPercent < 1 || elapsedMs <= 0) {
-    return { percent: usedPercent, remaining: usedPercent < 1 ? ">window" : "n/a" };
+// ============================================================================
+// Claude OAuth Usage API (api.anthropic.com/api/oauth/usage)
+// ============================================================================
+function readClaudeCredentials() {
+  const data = readJson(CLAUDE_CREDENTIALS_PATH, null);
+  if (!data) return null;
+  const creds = data.claudeAiOauth || data;
+  if (!creds.accessToken) return null;
+  return {
+    accessToken: creds.accessToken,
+    refreshToken: creds.refreshToken,
+    expiresAt: creds.expiresAt,
+  };
+}
+
+function refreshClaudeAccessToken(refreshToken) {
+  return new Promise((resolve) => {
+    const clientId = process.env.CLAUDE_CODE_OAUTH_CLIENT_ID || DEFAULT_OAUTH_CLIENT_ID;
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: clientId,
+    }).toString();
+    const req = https.request({
+      hostname: "platform.claude.com",
+      path: "/v1/oauth/token",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": Buffer.byteLength(body),
+      },
+      timeout: CLAUDE_API_TIMEOUT_MS,
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        if (res.statusCode === 200) {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.access_token) {
+              resolve({
+                accessToken: parsed.access_token,
+                refreshToken: parsed.refresh_token || refreshToken,
+                expiresAt: parsed.expires_in
+                  ? Date.now() + parsed.expires_in * 1000
+                  : parsed.expires_at,
+              });
+              return;
+            }
+          } catch { /* parse 실패 */ }
+        }
+        resolve(null);
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.end(body);
+  });
+}
+
+function writeBackClaudeCredentials(creds) {
+  try {
+    const data = readJson(CLAUDE_CREDENTIALS_PATH, null);
+    if (!data) return;
+    const target = data.claudeAiOauth || data;
+    target.accessToken = creds.accessToken;
+    if (creds.expiresAt != null) target.expiresAt = creds.expiresAt;
+    if (creds.refreshToken) target.refreshToken = creds.refreshToken;
+    writeFileSync(CLAUDE_CREDENTIALS_PATH, JSON.stringify(data, null, 2));
+  } catch { /* 쓰기 실패 무시 */ }
+}
+
+function fetchClaudeUsageFromApi(accessToken) {
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: "api.anthropic.com",
+      path: "/api/oauth/usage",
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json",
+      },
+      timeout: CLAUDE_API_TIMEOUT_MS,
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        if (res.statusCode === 200) {
+          try { resolve(JSON.parse(data)); } catch { resolve(null); }
+        } else { resolve(null); }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+function parseClaudeUsageResponse(response) {
+  const fiveHour = response?.five_hour?.utilization;
+  const sevenDay = response?.seven_day?.utilization;
+  if (fiveHour == null && sevenDay == null) return null;
+  return {
+    fiveHourPercent: clampPercent(fiveHour ?? 0),
+    weeklyPercent: clampPercent(sevenDay ?? 0),
+    fiveHourResetsAt: response?.five_hour?.resets_at || null,
+    weeklyResetsAt: response?.seven_day?.resets_at || null,
+  };
+}
+
+function readClaudeUsageSnapshot() {
+  const cache = readJson(CLAUDE_USAGE_CACHE_PATH, null);
+  if (!cache?.data) return { data: null, shouldRefresh: true };
+  const ts = Number(cache.timestamp);
+  const ageMs = Number.isFinite(ts) ? Date.now() - ts : Number.MAX_SAFE_INTEGER;
+  const isFresh = ageMs < CLAUDE_USAGE_STALE_MS;
+  return { data: cache.data, shouldRefresh: !isFresh || !!cache.error };
+}
+
+function writeClaudeUsageCache(data, error = false) {
+  writeJsonSafe(CLAUDE_USAGE_CACHE_PATH, { timestamp: Date.now(), data, error });
+}
+
+async function fetchClaudeUsage(forceRefresh = false) {
+  if (!forceRefresh) {
+    const snapshot = readClaudeUsageSnapshot();
+    if (!snapshot.shouldRefresh && snapshot.data) return snapshot.data;
   }
-  const projectedTotalMs = elapsedMs * (100 / usedPercent);
-  const remainingMs = Math.max(0, Math.min(windowMs, projectedTotalMs - elapsedMs));
-  return { percent: usedPercent, remaining: formatDuration(remainingMs) };
+  let creds = readClaudeCredentials();
+  if (!creds) { writeClaudeUsageCache(null, true); return null; }
+
+  // 토큰 만료 시 리프레시
+  if (creds.expiresAt && creds.expiresAt <= Date.now() && creds.refreshToken) {
+    const refreshed = await refreshClaudeAccessToken(creds.refreshToken);
+    if (refreshed) {
+      creds = { ...creds, ...refreshed };
+      writeBackClaudeCredentials(creds);
+    } else {
+      writeClaudeUsageCache(null, true);
+      return null;
+    }
+  }
+
+  const response = await fetchClaudeUsageFromApi(creds.accessToken);
+  if (!response) { writeClaudeUsageCache(null, true); return null; }
+  const usage = parseClaudeUsageResponse(response);
+  writeClaudeUsageCache(usage, !usage);
+  return usage;
+}
+
+function scheduleClaudeUsageRefresh() {
+  const scriptPath = process.argv[1];
+  if (!scriptPath) return;
+  try {
+    const child = spawn(process.execPath, [scriptPath, CLAUDE_REFRESH_FLAG], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+  } catch { /* 백그라운드 실행 실패 무시 */ }
 }
 
 function getContextPercent(stdin) {
@@ -338,6 +508,23 @@ function getCodexEmail() {
   try {
     const auth = JSON.parse(readFileSync(CODEX_AUTH_PATH, "utf-8"));
     const idToken = auth?.tokens?.id_token;
+    if (!idToken) return null;
+    const parts = idToken.split(".");
+    if (parts.length < 2) return null;
+    let payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    while (payload.length % 4) payload += "=";
+    const decoded = JSON.parse(Buffer.from(payload, "base64").toString("utf-8"));
+    return decoded.email || null;
+  } catch { return null; }
+}
+
+// ============================================================================
+// Gemini JWT에서 이메일 추출
+// ============================================================================
+function getGeminiEmail() {
+  try {
+    const oauth = readJson(GEMINI_OAUTH_PATH, null);
+    const idToken = oauth?.id_token;
     if (!idToken) return null;
     const parts = idToken.split(".");
     if (parts.length < 2) return null;
@@ -628,49 +815,44 @@ function scanGeminiSessionTokens() {
 // ============================================================================
 // 라인 렌더러
 // ============================================================================
-function getClaudeRows(stdin, snapshot) {
-  const totalTokens = Number(snapshot.totalInputTokens || 0)
-    + Number(snapshot.totalCacheCreation || 0)
-    + Math.round(Number(snapshot.totalCacheRead || 0) * 0.1);
-  const startTime = snapshot.startTime ? new Date(snapshot.startTime).getTime() : Date.now();
-  const elapsedMs = Math.max(0, Date.now() - startTime);
-  const fiveHour = estimateWindowUsage(totalTokens, CLAUDE_FIVE_HOUR_TOKEN_CAP, elapsedMs, FIVE_HOUR_MS);
-  const weekly = estimateWindowUsage(totalTokens, CLAUDE_WEEK_TOKEN_CAP, elapsedMs, SEVEN_DAY_MS);
+function getClaudeRows(stdin, claudeUsage) {
   const contextPercent = getContextPercent(stdin);
   const prefix = `${bold(claudeOrange("c"))}:`;
 
+  // API 실측 데이터 사용 (없으면 플레이스홀더)
+  const fiveHourPercent = claudeUsage?.fiveHourPercent ?? 0;
+  const weeklyPercent = claudeUsage?.weeklyPercent ?? 0;
+  const fiveHourReset = claudeUsage?.fiveHourResetsAt
+    ? formatResetRemaining(claudeUsage.fiveHourResetsAt)
+    : (claudeUsage ? "n/a" : "--h--m");
+  const weeklyReset = claudeUsage?.weeklyResetsAt
+    ? formatResetRemainingDayHour(claudeUsage.weeklyResetsAt)
+    : (claudeUsage ? "n/a" : "--d--h");
+
   if (COMPACT_MODE) {
-    // 컴팩트: 바 없이 퍼센트+시간만
-    const quotaSection = `${dim("5h:")}${colorByPercent(fiveHour.percent, `${fiveHour.percent}%`)} ` +
-      `${dim("wk:")}${colorByPercent(weekly.percent, `${weekly.percent}%`)} ` +
+    const quotaSection = `${dim("5h:")}${colorByPercent(fiveHourPercent, `${fiveHourPercent}%`)} ` +
+      `${dim("wk:")}${colorByPercent(weeklyPercent, `${weeklyPercent}%`)} ` +
       `${dim("ctx:")}${colorByPercent(contextPercent, `${contextPercent}%`)}`;
     return [{ prefix, left: quotaSection, right: "" }];
   }
 
-  const fiveHourBar = coloredBar(fiveHour.percent, 6);
-  const weeklyBar = coloredBar(weekly.percent, 6);
+  const fiveHourBar = coloredBar(fiveHourPercent, 6);
+  const weeklyBar = coloredBar(weeklyPercent, 6);
   const ctxBar = coloredBar(contextPercent, 6);
-  const fiveHourPercentCell = formatPercentCell(fiveHour.percent);
-  const weeklyPercentCell = formatPercentCell(weekly.percent);
-  const fiveHourTimeCell = formatTimeCell(fiveHour.remaining);
-  const weeklyTimeCell = formatTimeCell(weekly.remaining);
-  const quotaSection = `${dim("5h:")}${fiveHourBar} ${colorByPercent(fiveHour.percent, fiveHourPercentCell)} ` +
+  const hasData = claudeUsage != null;
+  const fiveHourPercentCell = hasData ? formatPercentCell(fiveHourPercent) : formatPlaceholderPercentCell();
+  const weeklyPercentCell = hasData ? formatPercentCell(weeklyPercent) : formatPlaceholderPercentCell();
+  const fiveHourTimeCell = formatTimeCell(fiveHourReset);
+  const weeklyTimeCell = formatTimeCell(weeklyReset);
+  const quotaSection = `${dim("5h:")}${fiveHourBar} ${colorByPercent(fiveHourPercent, fiveHourPercentCell)} ` +
     `${dim(fiveHourTimeCell)} ` +
-    `${dim("wk:")}${weeklyBar} ${colorByPercent(weekly.percent, weeklyPercentCell)} ` +
+    `${dim("wk:")}${weeklyBar} ${colorByPercent(weeklyPercent, weeklyPercentCell)} ` +
     `${dim(weeklyTimeCell)}`;
   const contextSection = `${dim("ctx:")}${ctxBar} ${colorByPercent(contextPercent, `${contextPercent}%`)}`;
   if (contextPercent >= CONTEXT_ALERT_SPLIT_THRESHOLD) {
     return [
-      {
-        prefix,
-        left: contextSection,
-        right: "",
-      },
-      {
-        prefix: `${bold(claudeOrange("c"))}:`,
-        left: quotaSection,
-        right: "",
-      },
+      { prefix, left: contextSection, right: "" },
+      { prefix: `${bold(claudeOrange("c"))}:`, left: quotaSection, right: "" },
     ];
   }
   return [{ prefix, left: quotaSection, right: contextSection }];
@@ -681,9 +863,9 @@ function getAccountLabel(provider, accountsConfig, accountsState, codexEmail) {
   const providerState = accountsState?.providers?.[provider] || {};
   const lastId = providerState.last_selected_id;
   const picked = providerConfig.find((a) => a.id === lastId) || providerConfig[0]
-    || { id: `${provider}-main`, label: `${provider}-main` };
+    || { id: `${provider}-main`, label: provider };
   let label = picked.label || picked.id;
-  if (provider === "codex" && codexEmail) label = codexEmail;
+  if (codexEmail) label = codexEmail;
   if (label.includes("@")) label = label.split("@")[0];
   return label;
 }
@@ -805,6 +987,12 @@ function getProviderRow(provider, marker, markerColor, qosProfile, accountsConfi
 // 메인
 // ============================================================================
 async function main() {
+  // 백그라운드 Claude 사용량 리프레시
+  if (process.argv.includes(CLAUDE_REFRESH_FLAG)) {
+    await fetchClaudeUsage(true);
+    return;
+  }
+
   if (process.argv.includes(CODEX_REFRESH_FLAG)) {
     refreshCodexRateLimitsCache();
     return;
@@ -829,7 +1017,10 @@ async function main() {
   const qosProfile = readJson(QOS_PATH, { providers: {} });
   const accountsConfig = readJson(ACCOUNTS_CONFIG_PATH, { providers: {} });
   const accountsState = readJson(ACCOUNTS_STATE_PATH, { providers: {} });
-  const claudeSnapshot = readJson(CLAUDE_SNAPSHOT_PATH, {});
+  const claudeUsageSnapshot = readClaudeUsageSnapshot();
+  if (claudeUsageSnapshot.shouldRefresh) {
+    scheduleClaudeUsageRefresh();
+  }
   const geminiAccountId = getProviderAccountId("gemini", accountsConfig, accountsState);
   const codexSnapshot = readCodexRateLimitSnapshot();
   const geminiSessionSnapshot = readGeminiSessionSnapshot();
@@ -848,6 +1039,7 @@ async function main() {
   // 실측 데이터 추출
   const stdin = await stdinPromise;
   const codexEmail = getCodexEmail();
+  const geminiEmail = getGeminiEmail();
   const codexBuckets = codexSnapshot.buckets;
   const geminiSession = geminiSessionSnapshot.session;
   const geminiQuota = geminiQuotaSnapshot.quota;
@@ -859,11 +1051,11 @@ async function main() {
     || null;
 
   const rows = [
-    ...getClaudeRows(stdin, claudeSnapshot),
+    ...getClaudeRows(stdin, claudeUsageSnapshot.data),
     getProviderRow("codex", "x", codexWhite, qosProfile, accountsConfig, accountsState,
       codexBuckets ? { type: "codex", buckets: codexBuckets } : null, codexEmail),
     getProviderRow("gemini", "g", geminiBlue, qosProfile, accountsConfig, accountsState,
-      { type: "gemini", quotaBucket: geminiBucket, session: geminiSession }, null),
+      { type: "gemini", quotaBucket: geminiBucket, session: geminiSession }, geminiEmail),
   ];
   const lines = renderAlignedRows(rows);
 
