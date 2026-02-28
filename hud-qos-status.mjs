@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import https from "node:https";
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 
 // ============================================================================
 // ANSI 색상 (OMC colors.js 스키마 일치)
@@ -102,7 +102,49 @@ const CONTEXT_ALERT_SPLIT_THRESHOLD = 95;
 // ============================================================================
 // 모바일/Termux 컴팩트 모드 감지
 // ============================================================================
-const COMPACT_MODE = !!(process.env.TERMUX_VERSION || process.argv.includes("--compact"));
+const HUD_CONFIG_PATH = join(homedir(), ".omc", "config", "hud.json");
+const COMPACT_COLS_THRESHOLD = 80;
+
+function getTerminalColumns() {
+  if (process.stdout.columns) return process.stdout.columns;
+  if (process.stderr.columns) return process.stderr.columns;
+  const envCols = Number(process.env.COLUMNS);
+  if (envCols > 0) return envCols;
+  try {
+    if (process.platform === "win32") {
+      const raw = execSync("mode con", { timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }).toString();
+      const m = raw.match(/Columns[^:]*:\s*(\d+)/i) || raw.match(/열[^:]*:\s*(\d+)/);
+      if (m) return Number(m[1]);
+    } else {
+      const raw = execSync("tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}'", {
+        timeout: 2000, stdio: ["pipe", "pipe", "pipe"],
+      }).toString().trim();
+      if (raw && !isNaN(Number(raw))) return Number(raw);
+    }
+  } catch { /* 감지 실패 */ }
+  return 0;
+}
+
+function detectCompactMode() {
+  // 1. 명시적 CLI 플래그
+  if (process.argv.includes("--compact")) return true;
+  if (process.argv.includes("--no-compact")) return false;
+  // 2. 환경변수 오버라이드
+  if (process.env.TERMUX_VERSION) return true;
+  if (process.env.OMC_HUD_COMPACT === "1") return true;
+  if (process.env.OMC_HUD_COMPACT === "0") return false;
+  // 3. 설정 파일 (~/.omc/config/hud.json)
+  const hudConfig = readJson(HUD_CONFIG_PATH, null);
+  if (hudConfig?.compact === true || hudConfig?.compact === "always") return true;
+  if (hudConfig?.compact === false || hudConfig?.compact === "never") return false;
+  // 4. 터미널 폭 자동 감지 (TTY 있을 때만 유효)
+  const threshold = Number(hudConfig?.compactThreshold) || COMPACT_COLS_THRESHOLD;
+  const cols = getTerminalColumns();
+  if (cols > 0 && cols < threshold) return true;
+  return false;
+}
+
+const COMPACT_MODE = detectCompactMode();
 
 // ============================================================================
 // 유틸
@@ -836,19 +878,16 @@ function getClaudeRows(stdin, claudeUsage) {
     return [{ prefix, left: quotaSection, right: "" }];
   }
 
-  const fiveHourBar = coloredBar(fiveHourPercent, 6);
-  const weeklyBar = coloredBar(weeklyPercent, 6);
-  const ctxBar = coloredBar(contextPercent, 6);
   const hasData = claudeUsage != null;
   const fiveHourPercentCell = hasData ? formatPercentCell(fiveHourPercent) : formatPlaceholderPercentCell();
   const weeklyPercentCell = hasData ? formatPercentCell(weeklyPercent) : formatPlaceholderPercentCell();
   const fiveHourTimeCell = formatTimeCell(fiveHourReset);
   const weeklyTimeCell = formatTimeCell(weeklyReset);
-  const quotaSection = `${dim("5h:")}${fiveHourBar} ${colorByPercent(fiveHourPercent, fiveHourPercentCell)} ` +
+  const quotaSection = `${dim("5h:")}${colorByPercent(fiveHourPercent, fiveHourPercentCell)} ` +
     `${dim(fiveHourTimeCell)} ` +
-    `${dim("wk:")}${weeklyBar} ${colorByPercent(weeklyPercent, weeklyPercentCell)} ` +
+    `${dim("wk:")}${colorByPercent(weeklyPercent, weeklyPercentCell)} ` +
     `${dim(weeklyTimeCell)}`;
-  const contextSection = `${dim("ctx:")}${ctxBar} ${colorByPercent(contextPercent, `${contextPercent}%`)}`;
+  const contextSection = `${dim("ctx:")}${colorByPercent(contextPercent, `${contextPercent}%`)}`;
   if (contextPercent >= CONTEXT_ALERT_SPLIT_THRESHOLD) {
     return [
       { prefix, left: contextSection, right: "" },
@@ -929,9 +968,9 @@ function getProviderRow(provider, marker, markerColor, qosProfile, accountsConfi
       const weekP = clampPercent(main.secondary?.used_percent ?? 0);
       const fiveReset = formatResetRemaining(main.primary?.resets_at) || "n/a";
       const weekReset = formatResetRemainingDayHour(main.secondary?.resets_at) || "n/a";
-      quotaSection = `${dim("5h:")}${coloredBar(fiveP, 6)} ${colorByPercent(fiveP, formatPercentCell(fiveP))} ` +
+      quotaSection = `${dim("5h:")}${colorByPercent(fiveP, formatPercentCell(fiveP))} ` +
         `${dim(formatTimeCell(fiveReset))} ` +
-        `${dim("wk:")}${coloredBar(weekP, 6)} ${colorByPercent(weekP, formatPercentCell(weekP))} ` +
+        `${dim("wk:")}${colorByPercent(weekP, formatPercentCell(weekP))} ` +
         `${dim(formatTimeCell(weekReset))}`;
     }
   }
@@ -947,18 +986,16 @@ function getProviderRow(provider, marker, markerColor, qosProfile, accountsConfi
     // "5/60" → " 5/60" (5자 고정폭, 최대 "60/60")
     const rpmCountRaw = `${rpm.count}/${GEMINI_RPM_LIMIT}`;
     const rpmCountStr = rpmCountRaw.padStart(5);
-    const rpmBar = `${dim("1m:")}${coloredBar(rpm.percent, 6)} ` +
-      `${colorByPercent(rpm.percent, rpmCountStr)} ${rateLimitSection}`;
+    const rpmBar = `${dim("1m:")}${colorByPercent(rpm.percent, rpmCountStr)} ${rateLimitSection}`;
     if (bucket) {
       // API에서 가져온 실측 쿼터
       const usedP = clampPercent((1 - (bucket.remainingFraction ?? 1)) * 100);
       const rstRemaining = formatResetRemaining(bucket.resetTime) || "n/a";
-      quotaSection = `${dim("1d:")}${coloredBar(usedP, 6)} ` +
-        `${colorByPercent(usedP, formatPercentCell(usedP))} ${dim(formatTimeCell(rstRemaining))} ` +
+      quotaSection = `${dim("1d:")}${colorByPercent(usedP, formatPercentCell(usedP))} ${dim(formatTimeCell(rstRemaining))} ` +
         rpmBar;
     } else {
       // 비동기 갱신 전 플레이스홀더 (회색)
-      quotaSection = `${dim("1d:")}${dim("░░░░░░")} ${dim(formatPlaceholderPercentCell())} ` +
+      quotaSection = `${dim("1d:")}${dim(formatPlaceholderPercentCell())} ` +
         `${dim(formatTimeCell("--h--m"))} ` +
         rpmBar;
     }
@@ -1058,8 +1095,10 @@ async function main() {
       { type: "gemini", quotaBucket: geminiBucket, session: geminiSession }, geminiEmail),
   ];
   const lines = renderAlignedRows(rows);
-
-  process.stdout.write(`${lines.join("\n")}\n`);
+  // Context low 메시지 뒤에 HUD가 분리되도록 선행 개행 추가
+  const contextPercent = getContextPercent(stdin);
+  const contextLowPrefix = contextPercent >= 85 ? "\n" : "";
+  process.stdout.write(`${contextLowPrefix}${lines.join("\n")}\n`);
 }
 
 main().catch(() => {

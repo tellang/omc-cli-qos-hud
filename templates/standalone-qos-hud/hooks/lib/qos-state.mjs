@@ -10,8 +10,8 @@ const CAP_GROWTH_STREAK_THRESHOLD = {
   gemini: 10,
 };
 const CAP_HARD_LIMIT = {
-  codex: 12,
-  gemini: 6,
+  codex: 30,
+  gemini: 30,
 };
 
 const DEFAULT_PROFILE = {
@@ -143,6 +143,13 @@ export function inferProvider(command) {
   if (/\bcodex(?:\.exe)?\s+(?:--\w+\s+\w+\s+)*exec\b/i.test(cmd)) return "codex";
   if (/\bgemini(?:\.exe)?\s+(?:.*?-y|.*?--yes)\s+-p\b/i.test(cmd)) return "gemini";
   if (/\bgemini(?:\.exe)?\s+-p\s+.*?(?:-y|--yes)\b/i.test(cmd)) return "gemini";
+  // cli-route.sh 경유 감지 (bteam)
+  const cliRouteMatch = cmd.match(/cli-route\.sh\s+([\w-]+)/);
+  if (cliRouteMatch) {
+    const agent = cliRouteMatch[1];
+    if (/^(executor|build-fixer|debugger|deep-executor|architect|planner|critic|analyst|code-reviewer|security-reviewer|quality-reviewer|scientist|document-specialist|spark)$/.test(agent)) return "codex";
+    if (/^(designer|writer)$/.test(agent)) return "gemini";
+  }
   return null;
 }
 
